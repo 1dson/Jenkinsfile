@@ -1,0 +1,2 @@
+This repository contains a Jenkins Declarative Pipeline example. This example shows how
+to use Zalenium docker image to execute a ZAP security scanner. The container and zalenium are deployed on the same box in this example.

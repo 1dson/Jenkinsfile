@@ -1,0 +1,184 @@
+#!/usr/bin/env groovy
+
+def randomPort() {
+  return Math.abs(new Random().nextInt() % 1000 + 5500)
+}
+
+pipeline {
+  agent {
+    node {
+      label 'docker'
+    }
+  }
+  options {
+    timeout(time: 1, unit: 'HOURS')
+  }
+  tools {
+    maven '3.3.9'
+  }
+    environment {
+      slackChan='#Channel'
+      slackInit='#D4DADF' //hex colour ref
+      slackAbort='#FF9FA1' //hex colour ref
+      slackFail='#FF9FA1' //hex colour ref
+      slackSuccess='#8DFFC3' //hex colour ref
+      slackCompleted='#4A821C' //hex colour ref
+      owaspPort=null
+    }
+
+  parameters {
+    string(name: 'branch', defaultValue: 'master', description: 'Determines which branch we will clone at the beginning of the pipeline')
+    booleanParam(name: 'clearMVN', defaultValue: false, description: 'Clear MVN cache')
+  }
+
+    stages {
+      stage ('Clean Up') {
+        steps {
+          script{
+            sh( """#!/bin/bash
+                        if docker ps | grep -q zap-scanner
+                        then
+                          docker stop zap-scanner
+                        fi
+                    """
+            )
+            try{
+              sh( "docker rm -f \"\$(docker ps -a -q)\"")
+              sh( "docker rmi \"\$(docker images -q)\"")
+            } catch (Exception e){}
+          }
+        }
+      }
+      stage ('Initialise') {
+        steps {
+          gitlabCommitStatus (name: "${env.STAGE_NAME}") {
+            // initialise
+            slackSend (channel: slackChan, color: '${environment.slackInit}', message: "STARTED: ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n Environment:${env.platformEnv}")
+            checkout changelog: false, poll: false, scm: [$class: 'GitSCM', branches: [[name:'*/'+"${params.branch}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'git', url: "${params.gitRepo}"]]]
+          }
+        }
+      }
+      stage ('Start Zalenium') {
+        steps {
+          gitlabCommitStatus (name: "${env.STAGE_NAME}") {
+            // execute
+            script{
+               script {
+                 owaspPort=randomPort()
+               }
+              sh( "docker pull locationOfSeleniumImage:Port/selenium")
+              sh( "docker pull locationOfZaleniumImage:Port/zalenium" )
+              sh( "docker run -d --rm --name zap-scanner -p 4444:4444 \
+                        -e DOCKER=17.06.2-ce \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v /tmp/videos:/home/seluser/videos \
+                        -v /opt/gradle/:/opt/gradle \
+                        -v /opt/owasp/:/opt/owasp \
+                        -v path to jenkins pipeline:/tmp/node/path to jenkins pipeline \
+                        -e \"no_proxy=localhost,*.proxyURL\" \
+                        -e \"zalenium_http_proxy=proxyURL:proxyPort\" \
+                        -e \"zalenium_https_proxy=hproxyURL:proxyPort\" \
+                        -e \"zalenium_no_proxy=172.17/12,0.0.0.0,*.proxyURL\" \
+                        -e ZALENIUM_SELENIUM_CONTAINER_MEMORY_LIMIT=2147483648 \
+                        --privileged locationOfZaleniumImage:Port/zalenium start \
+                        --seleniumImageName locationOfSeleniumImage:Port/selenium \
+                        --debugEnabled true \
+                        --desiredContainers 1 --maxTestSessions 1 \
+                        --maxDockerSeleniumContainers 1 \
+                        --videoRecordingEnabled ${params.RecordVideo}"
+              )
+              sh("sleep 20")
+            }
+          }
+        }
+      }
+      stage ('Setup application.conf') {
+            steps {
+              gitlabCommitStatus (name: "${env.STAGE_NAME}") {
+                // execute
+                script{
+                  sh( """#!/bin/bash
+                      echo 'downloadDirectory = \"${params.downloadDirectory}\"' > src/test/resources/application.conf
+                      echo 'password = \"${params.password}\"' >> src/test/resources/application.conf
+                      echo 'reportName = \"${params.reportName}\"' >> src/test/resources/application.conf
+                      echo 'contextName = \"${params.contextName}\"' >> src/test/resources/application.conf
+                      echo 'policy = \"${params.policy}\"' >> src/test/resources/application.conf
+                      echo 'attackStrength = \"${params.attackStrength}\"' >> src/test/resources/application.conf
+                      echo 'ipAddress = \"${params.ipAddress}\"' >> src/test/resources/application.conf
+                  """
+                  )
+                }
+              }
+            }
+        }
+         stage ('Start Daemon') {
+        steps {
+         sh( "/opt/owasp/zap.sh -daemon -host 0.0.0.0 -port ${owaspPort} -config api.disablekey=true -config 'api.addrs.addr.name=.*' -config api.addrs.addr.regex=true </dev/null &>/dev/null &") // start daemon
+          sleep(10)
+        }
+      }
+       stage('Clear MVN cache')  {
+          when {
+            expression { params.clearMVN }
+          }
+          steps {
+            script{
+              sh( "mvn dependency:purge-local-repository -DactTransitively=false -DreResolve=false"
+              )
+            }
+          }
+        }
+        stage ('Execute Tests') {
+            steps {
+              gitlabCommitStatus (name: "${env.STAGE_NAME}") {
+                // execute
+                script{
+                try{
+                 sh( "mvn clean test -U ${params.optional_params_args} -DproxyPort=${owaspPort} -Dwdm.proxy='if you have one'")
+                  }catch(Exception e){}
+                }
+              }
+            }
+        }
+
+      stage ('Stop Scanner') {
+        steps {
+           gitlabCommitStatus (name: "${env.STAGE_NAME}") {
+                  // execute
+                  // rm -rf /tmp/videos
+                  script{
+                    sh( '''#!/bin/bash
+                    docker stop zap-scanner
+                    rm -rf /tmp/videos
+                    ''')
+                  }
+              }
+      }
+    post {
+      always {
+               script{
+                  sh ('''#!/bin/bash
+                        rm -rf src/
+                        rm -rf target/
+                        rm -rf .gitignore
+                        rm -rf pom.xml
+                        rm -rf README.md
+                        rm -rf .git/
+                        ''')
+                      }
+                    }
+      success {
+        slackSend (channel: slackChan, color: slackCompleted, message: "SUCCESSFUL:\t ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n User:         ${env.gitlabMergedByUser}\n  Logs:\t     ${env.BUILD_URL}console")
+      }
+
+      failure {
+        slackSend (channel: slackChan, color: slackFail, message: "FAILED:\t Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'\n User:         '${env.gitlabMergedByUser}'\n  Logs:\t     ${env.BUILD_URL}console")
+	    }
+
+      aborted {
+        slackSend (channel: slackChan, color: slackAbort, message: "ABORTED:\t Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'\n User:         '${env.gitlabMergedByUser}'\n  Logs:\t     ${env.BUILD_URL}console")
+	    }
+    }
+  }
+}
+}
